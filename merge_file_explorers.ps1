@@ -10,13 +10,18 @@ param(
     [switch]$NoAnimation,
 
     # Skip the "press any key to continue" prompt at the end.
-    [switch]$NoPause
+    [switch]$NoPause,
+
+    # Multiplies every wait. Raise it if Explorer is slow to settle on your machine.
+    [ValidateRange(0.25, 10.0)]
+    [double]$DelayScale = 1.0
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -41,9 +46,29 @@ public static class ExplorerWindowControl
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetTopWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
     // Used only to hand focus back to this console once the merge is finished.
     [DllImport("kernel32.dll")]
     public static extern IntPtr GetConsoleWindow();
+
+    // Top-level windows, front to back. Used to break a tie between candidate
+    // destination windows in favour of the one you used most recently.
+    public static IntPtr[] WindowsFrontToBack()
+    {
+        var order = new List<IntPtr>();
+        IntPtr current = GetTopWindow(IntPtr.Zero);
+        while (current != IntPtr.Zero)
+        {
+            order.Add(current);
+            current = GetWindow(current, 2); // GW_HWNDNEXT
+        }
+        return order.ToArray();
+    }
 }
 
 // A donut.c style renderer, except the solid is a 2D folder icon extruded into a
@@ -414,6 +439,52 @@ function Set-MergeStatus {
     }
 }
 
+# Every wait in the merge path goes through here, so -DelayScale tunes all of
+# them together and the animation keeps drawing for the whole duration.
+function Wait-Merge {
+    param(
+        [Parameter(Mandatory)]
+        [int]$Milliseconds
+    )
+
+    [MergeDisplay]::Pump([int][Math]::Round($Milliseconds * $script:DelayScale))
+}
+
+# Returns the focused element only when it is a text field, which is how the
+# address bar reports itself (ControlType.Edit, name "Address Bar"). Anything
+# else means Ctrl+L missed and the folder view still has focus.
+function Get-FocusedAddressBar {
+    try {
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        if ($null -eq $focused) { return $null }
+
+        $controlType = $focused.Current.ControlType
+        if ($controlType -ne [System.Windows.Automation.ControlType]::Edit -and
+            $controlType -ne [System.Windows.Automation.ControlType]::ComboBox) {
+            return $null
+        }
+
+        return $focused
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-AddressBarText {
+    param(
+        [Parameter(Mandatory)]
+        $Element
+    )
+
+    try {
+        return $Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-ExplorerFolderWindows {
     $shell = New-Object -ComObject Shell.Application
     $items = foreach ($window in @($shell.Windows())) {
@@ -450,9 +521,9 @@ function Set-ExplorerWindowForeground {
     }
 
     [void][ExplorerWindowControl]::ShowWindowAsync($Hwnd, 9) # SW_RESTORE
-    [MergeDisplay]::Pump(200)
+    Wait-Merge 300
     [void][ExplorerWindowControl]::SetForegroundWindow($Hwnd)
-    [MergeDisplay]::Pump(300)
+    Wait-Merge 600
 
     if ([ExplorerWindowControl]::GetForegroundWindow() -ne $Hwnd) {
         throw 'Could not focus the destination Explorer window. No source windows were closed.'
@@ -478,17 +549,41 @@ function Add-ExplorerFolderTab {
 
     Set-ExplorerWindowForeground -Hwnd $Hwnd
     [Windows.Forms.Clipboard]::SetText($Path)
+
+    # A new tab lands on Home with focus in the content view, and it takes a
+    # moment to settle. Ctrl+L sent too early is swallowed by that view.
     [Windows.Forms.SendKeys]::SendWait('^t')
-    [MergeDisplay]::Pump(350)
-    [Windows.Forms.SendKeys]::SendWait('^l')
-    [MergeDisplay]::Pump(100)
+    Wait-Merge 1200
+
+    # Never send Ctrl+A and Enter until the address bar is confirmed focused:
+    # in the folder view that pair selects every file and opens all of them.
+    $addressBar = $null
+    for ($attempt = 1; $attempt -le 3 -and $null -eq $addressBar; $attempt++) {
+        [Windows.Forms.SendKeys]::SendWait('^l')
+        Wait-Merge 600
+        $addressBar = Get-FocusedAddressBar
+    }
+
+    if ($null -eq $addressBar) {
+        throw "The address bar never took focus for '$Path', so the path was not typed. Nothing was selected or opened, and no source windows were closed. Try -DelayScale 2."
+    }
+
     [Windows.Forms.SendKeys]::SendWait('^a')
+    Wait-Merge 150
     [Windows.Forms.SendKeys]::SendWait('^v')
+    Wait-Merge 400
+
+    # Confirm the paste actually landed before committing with Enter.
+    $typedPath = Get-AddressBarText -Element $addressBar
+    if ($null -ne $typedPath -and $typedPath.TrimEnd('\') -ine $Path.TrimEnd('\')) {
+        throw "The address bar held '$typedPath' instead of '$Path', so nothing was submitted. No source windows were closed."
+    }
+
     [Windows.Forms.SendKeys]::SendWait('{ENTER}')
 
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
     do {
-        [MergeDisplay]::Pump(250)
+        Wait-Merge 250
         $destinationTabs = @(Get-ExplorerFolderWindows | Where-Object {
             $_.Hwnd -eq $Hwnd
         })
@@ -564,8 +659,24 @@ if ($windows.Count -eq 0) {
 }
 
 $windowGroups = @($windows | Group-Object { $_.Hwnd.ToInt64() })
+
+# Most tabs wins, because that is the least work. When windows tie - and they all
+# tie at one tab each in the common case - prefer the one nearest the front of
+# the Z-order, which is the Explorer window you used most recently.
+$zOrder = @{}
+$rank = 0
+foreach ($handle in [ExplorerWindowControl]::WindowsFrontToBack()) {
+    $zOrder[$handle.ToInt64()] = $rank
+    $rank++
+}
+
 $targetGroup = $windowGroups |
-    Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, Name |
+    Sort-Object -Property `
+        @{ Expression = 'Count'; Descending = $true },
+        @{ Expression = {
+            $key = [int64]$_.Name
+            if ($zOrder.ContainsKey($key)) { $zOrder[$key] } else { [int]::MaxValue }
+        } } |
     Select-Object -First 1
 $targetHwnd = [IntPtr][int64]$targetGroup.Name
 $sourceTabs = @($windows | Where-Object { $_.Hwnd -ne $targetHwnd })

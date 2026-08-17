@@ -17,6 +17,8 @@ powershell -ExecutionPolicy Bypass -File .\merge_file_explorers.ps1
 - Windows 11 (build with File Explorer tab support — `Ctrl+T` must open a new tab in Explorer)
 - Windows PowerShell 5.1 or PowerShell 7+
 - An interactive desktop session (the script drives the real Explorer UI, so it cannot run headless or over a disconnected RDP session)
+- An STA thread, because the clipboard is used to carry the path. Windows PowerShell 5.1 is STA by default; if you hit a "single thread apartment" error, launch with `powershell -STA`.
+- `UIAutomationClient` / `UIAutomationTypes`, which ship with the .NET Framework on every supported Windows install
 
 ### Parameters
 
@@ -24,6 +26,7 @@ powershell -ExecutionPolicy Bypass -File .\merge_file_explorers.ps1
 | --- | --- | --- | --- |
 | `-NoAnimation` | switch | off | Run without the spinning folder and progress bar; status lines are printed as plain text instead. Aliased as `-NoSplash`. |
 | `-NoPause` | switch | off | Skip the "press any key to continue" prompt at the end. |
+| `-DelayScale` | double (0.25–10) | `1.0` | Multiplies every wait. Raise it if Explorer is slow to settle on your machine. |
 | `-Verbose` | switch | off | Standard `CmdletBinding` verbose stream. |
 
 ```powershell
@@ -37,8 +40,8 @@ powershell -ExecutionPolicy Bypass -File .\merge_file_explorers.ps1
 ### What it actually does
 
 1. Enumerates open shell windows through the `Shell.Application` COM object and keeps only the ones that are `explorer.exe` showing a real filesystem directory. Control Panel windows, `This PC`, virtual namespaces and Internet Explorer style windows are ignored.
-2. Groups those tabs by window handle and picks the window that already has the most tabs as the destination, so it does the least work possible.
-3. For each remaining tab, it focuses the destination window, puts that tab's path on the clipboard, and sends `Ctrl+T` → `Ctrl+L` → `Ctrl+A` → `Ctrl+V` → `Enter` — exactly the keystrokes you would type yourself to open a new tab and navigate it.
+2. Groups those tabs by window handle and picks the window that already has the most tabs as the destination, so it does the least work possible. When windows tie — and they all tie at one tab each in the common case — it prefers the one nearest the front of the Z-order, meaning the Explorer window you used most recently.
+3. For each remaining tab, it focuses the destination window, puts that tab's path on the clipboard, and sends `Ctrl+T` → `Ctrl+L` → `Ctrl+A` → `Ctrl+V` → `Enter` — exactly the keystrokes you would type yourself to open a new tab and navigate it. Between `Ctrl+L` and `Ctrl+A` it checks via UI Automation that the address bar really holds keyboard focus, and after the paste it checks that the address bar really contains the target path, before it commits with `Enter`.
 4. Waits (up to 8 seconds per tab) until the destination window really reports a new tab at that path before moving on. If Explorer does not cooperate, the script throws and **no source window is closed**.
 5. Restores whatever was on your clipboard before it started.
 6. Only after every tab has been recreated does it post `WM_CLOSE` to the source windows.
@@ -80,6 +83,7 @@ If the merge stops partway, the same list is printed for the tabs that *did* lan
 - **Nothing is destroyed.** Source windows are closed with `WM_CLOSE` (the same message the X button sends) only after their folder is confirmed open as a tab in the destination window. No file, folder, registry key, or setting is ever touched.
 - **Your clipboard is restored.** The original clipboard contents are captured before the merge and put back in a `finally` block, so an error mid-merge still restores it.
 - **It fails loudly, not quietly.** `Set-StrictMode -Version Latest` and `$ErrorActionPreference = 'Stop'` are set at the top. If the destination window cannot be focused, or a tab does not appear, the script stops with a message rather than closing windows it should not.
+- **`Ctrl+A` and `Enter` are gated behind a focus check.** A freshly opened tab lands on Home with focus in the *content view*, and it takes Explorer a moment to settle. A `Ctrl+L` sent too early gets swallowed by that view — and then `Ctrl+A` selects every file in the folder and `Enter` opens all of them. So the script asks UI Automation what actually holds focus and will not send that pair until the answer is the address bar. It retries `Ctrl+L` up to three times, then gives up with a message suggesting `-DelayScale 2`.
 - **It only reads directory paths.** It never reads file contents, never enumerates what is inside the folders, and never sends anything anywhere.
 
 ### Known limitations
@@ -95,20 +99,21 @@ No. But it is worth explaining *why* an antivirus engine might raise an eyebrow 
 
 | What the script does | Why it looks suspicious | Why it is benign here |
 | --- | --- | --- |
-| `Add-Type` compiles inline C# at runtime | Malware uses this to build payloads in memory | The C# is fully visible in the file: six P/Invoke declarations, an ASCII renderer, and the console display that drives it. Nothing is downloaded, decoded, or decrypted. |
-| P/Invoke into `user32.dll` and `kernel32.dll` | Window manipulation is used by injectors and clickers | Six imports total: `SetForegroundWindow`, `ShowWindowAsync`, `IsWindow`, `GetForegroundWindow`, `PostMessage`, and `GetConsoleWindow` — focus a window, restore it, send it a close message, and find this console to focus it again at the end. No process memory is read or written. |
+| `Add-Type` compiles inline C# at runtime | Malware uses this to build payloads in memory | The C# is fully visible in the file: eight P/Invoke declarations, an ASCII renderer, and the console display that drives it. Nothing is downloaded, decoded, or decrypted. |
+| P/Invoke into `user32.dll` and `kernel32.dll` | Window manipulation is used by injectors and clickers | Eight imports total: `SetForegroundWindow`, `ShowWindowAsync`, `IsWindow`, `GetForegroundWindow`, `PostMessage`, `GetTopWindow`, `GetWindow`, and `GetConsoleWindow` — focus a window, restore it, send it a close message, walk the Z-order, and find this console to focus it again at the end. No process memory is read or written. |
 | `SendKeys` synthetic keystrokes | Keystroke automation resembles keylogging | Keystrokes are only *sent*, never captured. The five shortcuts sent are `Ctrl+T`, `Ctrl+L`, `Ctrl+A`, `Ctrl+V`, `Enter`. |
 | Clipboard read and write | Clipboard stealers exfiltrate wallet addresses and passwords | The clipboard is used as the transport for a folder path you already have open, and the original contents are restored afterwards. Nothing is logged or transmitted. |
+| UI Automation reads the focused element | Accessibility APIs can be used to scrape other apps | Two read-only questions, both about Explorer's own address bar: what control has focus, and what text is in it. It is a safety check — it is what stops the script from sending `Ctrl+A`+`Enter` into a folder view. |
 | Recommended with `-ExecutionPolicy Bypass` | A common malware launch pattern | Needed only because unsigned local scripts are blocked by default. You can instead sign it, or run `Unblock-File .\merge_file_explorers.ps1` once. |
 
-Things the script contains **zero** of: network calls, downloads, `Invoke-Expression`, base64 or otherwise obfuscated payloads, scheduled tasks, registry writes, persistence of any kind, file deletion, elevation prompts, and telemetry. Read it — it is 543 lines of commented PowerShell and C#.
+Things the script contains **zero** of: network calls, downloads, `Invoke-Expression`, base64 or otherwise obfuscated payloads, scheduled tasks, registry writes, persistence of any kind, file deletion, elevation prompts, and telemetry. Read it — it is 635 lines of commented PowerShell and C#.
 
 ### VirusTotal
 
 `merge_file_explorers.ps1`
 
 ```
-SHA256: F35847A009106CC184C84A6DD767D313599DAFCD94DE62A19A711BE6B33F15BB
+SHA256: 5780B9BDBF753655EBEF6680E3A14A8BDC18362510DAB3B41E82B6A111D2FE83
 ```
 
 Verify the copy you downloaded matches before you trust any report below:

@@ -5,12 +5,12 @@
 
 [CmdletBinding()]
 param(
-    # Skip the rotating ASCII folder intro.
-    [switch]$NoSplash,
+    # Run without the spinning ASCII folder and progress bar.
+    [Alias('NoSplash')]
+    [switch]$NoAnimation,
 
-    # How long the intro spins, in seconds.
-    [ValidateRange(0, 30)]
-    [double]$SplashSeconds = 3.0
+    # Skip the "press any key to continue" prompt at the end.
+    [switch]$NoPause
 )
 
 Set-StrictMode -Version Latest
@@ -22,6 +22,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public static class ExplorerWindowControl
 {
@@ -39,6 +40,10 @@ public static class ExplorerWindowControl
 
     [DllImport("user32.dll")]
     public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    // Used only to hand focus back to this console once the merge is finished.
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
 }
 
 // A donut.c style renderer, except the solid is a 2D folder icon extruded into a
@@ -60,6 +65,10 @@ public static class FolderSpinner
     private const double BodyTop = 0.45;
     private const double TabRight = -0.15;
     private const double TabTop = 0.75;
+
+    // The bottom three rows of every frame are reserved for the progress bar,
+    // the status line, and the watermark.
+    public const int ReservedRows = 4;
 
     private static double[] _px, _py, _pz, _nx, _ny, _nz;
 
@@ -87,7 +96,7 @@ public static class FolderSpinner
         nrm.Add(nx / len); nrm.Add(ny / len); nrm.Add(nz / len);
     }
 
-    private static void Build()
+    public static void Build()
     {
         if (_px != null) return;
 
@@ -158,22 +167,25 @@ public static class FolderSpinner
 
     private static void Stamp(char[] buffer, int stride, int width, int row, string text)
     {
-        if (row < 0 || text.Length > width) return;
+        if (row < 0 || string.IsNullOrEmpty(text) || text.Length > width) return;
         int start = row * stride + (width - text.Length) / 2;
         for (int i = 0; i < text.Length; i++) buffer[start + i] = text[i];
     }
 
-    // Renders one frame into a newline separated buffer of `height` rows.
-    public static char[] Frame(double angle, int width, int height)
+    // Renders one frame into a newline separated buffer of `height` rows: the
+    // spinning folder, then the progress bar, status line, and watermark.
+    public static char[] Frame(double angle, int width, int height,
+                               string progressLine, string statusLine)
     {
         Build();
 
         int stride = width + 1;
+        int artRows = height - ReservedRows;
         var buffer = new char[stride * height];
-        var depth = new double[width * height];
+        var depth = new double[width * artRows];
 
         double cx = width / 2.0;
-        double cy = (height - 2) / 2.0;
+        double cy = artRows / 2.0;
         double cameraDistance = 4.6;
         double scale = width * 1.55;
 
@@ -210,7 +222,7 @@ public static class FolderSpinner
             double ooz = 1.0 / (cameraDistance + z);
             int sx = (int)Math.Round(cx + scale * ooz * x);
             int sy = (int)Math.Round(cy - scale * 0.5 * ooz * y);
-            if (sx < 0 || sx >= width || sy < 0 || sy >= height - 2) continue;
+            if (sx < 0 || sx >= width || sy < 0 || sy >= artRows) continue;
 
             int cell = sy * width + sx;
             if (ooz <= depth[cell]) continue;
@@ -222,65 +234,184 @@ public static class FolderSpinner
             buffer[sy * stride + sx] = Shades[shade];
         }
 
+        Stamp(buffer, stride, width, height - 3, progressLine);
+        Stamp(buffer, stride, width, height - 2, statusLine);
         Stamp(buffer, stride, width, height - 1, Watermark);
         return buffer;
     }
+}
 
-    public static void Run(double seconds)
+// Owns a fixed block of console rows and keeps the folder spinning while the
+// merge runs. Every wait the merge would have spent in Start-Sleep is spent in
+// Pump instead, so the animation is the progress indicator rather than an intro.
+public static class MergeDisplay
+{
+    private const int FrameMilliseconds = 28;
+
+    private static bool _active;
+    private static bool _cursorHidden;
+    private static int _width, _height, _top;
+    private static int _total, _done;
+    private static string _status = string.Empty;
+    private static Stopwatch _clock;
+
+    public static bool IsActive { get { return _active; } }
+
+    // Reserves the console rows and starts the clock. Falls back to inactive
+    // (Pump degrades to a plain sleep) on a redirected or undersized console.
+    public static void Start(int totalSteps)
     {
+        _total = Math.Max(1, totalSteps);
+        _done = 0;
+        _status = string.Empty;
+        _active = false;
+
         if (Console.IsOutputRedirected) return;
-
-        int width = Math.Min(80, Math.Max(40, Console.WindowWidth - 1));
-        int height = Math.Min(26, Math.Max(14, Console.WindowHeight - 3));
-        if (width < 40 || height < 14) return;
-
-        Build();
-
-        bool cursorHidden = false;
-        int top = 0;
-        try { Console.CursorVisible = false; cursorHidden = true; } catch { }
 
         try
         {
-            Console.Write(new string('\n', height));
-            top = Math.Max(0, Console.CursorTop - height);
+            _width = Math.Min(80, Math.Max(40, Console.WindowWidth - 1));
+            _height = Math.Min(26, Math.Max(16, Console.WindowHeight - 3));
+        }
+        catch { return; }
 
-            var clock = Stopwatch.StartNew();
-            while (clock.Elapsed.TotalSeconds < seconds)
+        if (_width < 40 || _height < 16) return;
+
+        FolderSpinner.Build();
+
+        try { Console.CursorVisible = false; _cursorHidden = true; } catch { }
+
+        try
+        {
+            Console.Write(new string('\n', _height));
+            _top = Math.Max(0, Console.CursorTop - _height);
+        }
+        catch
+        {
+            if (_cursorHidden) { try { Console.CursorVisible = true; } catch { } _cursorHidden = false; }
+            return;
+        }
+
+        _clock = Stopwatch.StartNew();
+        _active = true;
+        Draw();
+    }
+
+    public static void SetStatus(string text)
+    {
+        _status = text == null ? string.Empty : text;
+        Draw();
+    }
+
+    public static void SetProgress(int done)
+    {
+        _done = done < 0 ? 0 : (done > _total ? _total : done);
+        Draw();
+    }
+
+    // Renders frames for the given duration. This replaces every Start-Sleep in
+    // the merge path, which is what keeps the folder spinning during the work.
+    public static void Pump(int milliseconds)
+    {
+        if (milliseconds <= 0) return;
+
+        if (!_active)
+        {
+            Thread.Sleep(milliseconds);
+            return;
+        }
+
+        var elapsed = Stopwatch.StartNew();
+        while (true)
+        {
+            Draw();
+            long remaining = milliseconds - elapsed.ElapsedMilliseconds;
+            if (remaining <= 0) break;
+            Thread.Sleep((int)Math.Min(FrameMilliseconds, remaining));
+        }
+    }
+
+    // Releases the console rows, leaving the last frame on screen.
+    public static void Stop()
+    {
+        if (_active)
+        {
+            Draw();
+            try
             {
-                char[] buffer = Frame(clock.Elapsed.TotalSeconds * 2.1, width, height);
-
-                Console.SetCursorPosition(0, top);
-                Console.Out.Write(buffer, 0, buffer.Length - 1);
-
-                try { if (Console.KeyAvailable) { Console.ReadKey(true); break; } } catch { }
-
-                System.Threading.Thread.Sleep(28);
+                Console.SetCursorPosition(0, Math.Min(_top + _height, Console.BufferHeight - 1));
+                Console.WriteLine();
             }
+            catch { }
+            _active = false;
+        }
 
-            Console.SetCursorPosition(0, Math.Min(top + height, Console.BufferHeight - 1));
-            Console.WriteLine();
-        }
-        catch (Exception)
+        if (_cursorHidden)
         {
-            // A resized or non-interactive console must never break the merge.
+            try { Console.CursorVisible = true; } catch { }
+            _cursorHidden = false;
         }
-        finally
+    }
+
+    private static string BuildProgressLine()
+    {
+        double fraction = (double)_done / _total;
+        int barWidth = Math.Max(10, Math.Min(46, _width - 24));
+        int filled = (int)Math.Round(fraction * barWidth);
+        if (filled < 0) filled = 0;
+        if (filled > barWidth) filled = barWidth;
+
+        return "[" + new string('#', filled) + new string('-', barWidth - filled) + "] "
+             + _done + "/" + _total + "  " + (int)Math.Round(fraction * 100) + "%";
+    }
+
+    // Middle-elides long folder paths so the status line always fits the frame.
+    private static string Fit(string text, int width)
+    {
+        if (string.IsNullOrEmpty(text)) return string.Empty;
+        if (text.Length <= width) return text;
+        if (width <= 3) return text.Substring(0, Math.Max(0, width));
+
+        int keep = width - 3;
+        int left = keep / 2;
+        return text.Substring(0, left) + "..." + text.Substring(text.Length - (keep - left));
+    }
+
+    private static void Draw()
+    {
+        if (!_active) return;
+
+        char[] buffer = FolderSpinner.Frame(
+            _clock.Elapsed.TotalSeconds * 2.1, _width, _height,
+            BuildProgressLine(), Fit(_status, _width));
+
+        try
         {
-            if (cursorHidden) { try { Console.CursorVisible = true; } catch { } }
+            Console.SetCursorPosition(0, _top);
+            Console.Out.Write(buffer, 0, buffer.Length - 1);
+        }
+        catch
+        {
+            // A resized console must never break the merge.
+            _active = false;
         }
     }
 }
 '@
 
-function Show-FolderSplash {
+function Set-MergeStatus {
     param(
-        [double]$Seconds
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Text
     )
 
-    if ($Seconds -le 0) { return }
-
-    try { [FolderSpinner]::Run($Seconds) } catch { }
+    if ([MergeDisplay]::IsActive) {
+        [MergeDisplay]::SetStatus($Text)
+    }
+    elseif ($Text) {
+        Write-Host $Text
+    }
 }
 
 function Get-ExplorerFolderWindows {
@@ -319,9 +450,9 @@ function Set-ExplorerWindowForeground {
     }
 
     [void][ExplorerWindowControl]::ShowWindowAsync($Hwnd, 9) # SW_RESTORE
-    Start-Sleep -Milliseconds 200
+    [MergeDisplay]::Pump(200)
     [void][ExplorerWindowControl]::SetForegroundWindow($Hwnd)
-    Start-Sleep -Milliseconds 300
+    [MergeDisplay]::Pump(300)
 
     if ([ExplorerWindowControl]::GetForegroundWindow() -ne $Hwnd) {
         throw 'Could not focus the destination Explorer window. No source windows were closed.'
@@ -348,16 +479,16 @@ function Add-ExplorerFolderTab {
     Set-ExplorerWindowForeground -Hwnd $Hwnd
     [Windows.Forms.Clipboard]::SetText($Path)
     [Windows.Forms.SendKeys]::SendWait('^t')
-    Start-Sleep -Milliseconds 350
+    [MergeDisplay]::Pump(350)
     [Windows.Forms.SendKeys]::SendWait('^l')
-    Start-Sleep -Milliseconds 100
+    [MergeDisplay]::Pump(100)
     [Windows.Forms.SendKeys]::SendWait('^a')
     [Windows.Forms.SendKeys]::SendWait('^v')
     [Windows.Forms.SendKeys]::SendWait('{ENTER}')
 
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
     do {
-        Start-Sleep -Milliseconds 250
+        [MergeDisplay]::Pump(250)
         $destinationTabs = @(Get-ExplorerFolderWindows | Where-Object {
             $_.Hwnd -eq $Hwnd
         })
@@ -375,13 +506,60 @@ function Add-ExplorerFolderTab {
     }
 }
 
-if (-not $NoSplash) {
-    Show-FolderSplash -Seconds $SplashSeconds
+function Write-MergedFolderList {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Paths,
+
+        [Parameter(Mandatory)]
+        [string]$Heading
+    )
+
+    if ($Paths.Count -eq 0) { return }
+
+    Write-Host ''
+    Write-Host $Heading
+    $numberWidth = ([string]$Paths.Count).Length
+    for ($i = 0; $i -lt $Paths.Count; $i++) {
+        $number = ([string]($i + 1)).PadLeft($numberWidth)
+        Write-Host ("  {0}. {1}" -f $number, $Paths[$i])
+    }
+}
+
+function Restore-ConsoleFocus {
+    # The merge hands focus to Explorer, so take it back before prompting.
+    try {
+        $console = [ExplorerWindowControl]::GetConsoleWindow()
+        if ($console -ne [IntPtr]::Zero) {
+            [void][ExplorerWindowControl]::SetForegroundWindow($console)
+        }
+    }
+    catch { }
+}
+
+function Wait-ForAnyKey {
+    if ($NoPause) { return }
+
+    try { if ([Console]::IsInputRedirected) { return } } catch { return }
+
+    Restore-ConsoleFocus
+
+    try {
+        # Drop anything already buffered so a stray keystroke does not skip the prompt.
+        while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
+    }
+    catch { return }
+
+    Write-Host ''
+    Write-Host 'Press any key to continue...' -ForegroundColor DarkGray
+    try { [void][Console]::ReadKey($true) } catch { }
 }
 
 $windows = @(Get-ExplorerFolderWindows)
 if ($windows.Count -eq 0) {
     Write-Warning 'No open Explorer windows showing normal filesystem folders were found.'
+    Wait-ForAnyKey
     exit 1
 }
 
@@ -395,33 +573,77 @@ $sourceHwnds = @($sourceTabs | ForEach-Object { $_.Hwnd.ToInt64() } | Sort-Objec
 
 if ($sourceHwnds.Count -eq 0) {
     Write-Host ("Explorer is already consolidated in one window with {0} filesystem tab(s)." -f $targetGroup.Count)
+    Write-MergedFolderList -Paths @($targetGroup.Group | ForEach-Object { $_.Path }) -Heading 'Open folders:'
+    Write-Host ''
     Write-Host 'made with loving prompts by riecodes' -ForegroundColor DarkGray
+    Wait-ForAnyKey
     exit 0
 }
 
-$originalClipboard = [Windows.Forms.Clipboard]::GetDataObject()
+$mergedPaths = New-Object 'System.Collections.Generic.List[string]'
+$mergeError = $null
+$closedWindowCount = 0
+
+if (-not $NoAnimation) {
+    [MergeDisplay]::Start($sourceTabs.Count)
+}
 
 try {
-    foreach ($sourceTab in $sourceTabs) {
-        Add-ExplorerFolderTab -Hwnd $targetHwnd -Path $sourceTab.Path
+    $originalClipboard = [Windows.Forms.Clipboard]::GetDataObject()
+
+    try {
+        $tabNumber = 0
+        foreach ($sourceTab in $sourceTabs) {
+            $tabNumber++
+            Set-MergeStatus ("Merging tab {0} of {1}: {2}" -f $tabNumber, $sourceTabs.Count, $sourceTab.Path)
+            Add-ExplorerFolderTab -Hwnd $targetHwnd -Path $sourceTab.Path
+            $mergedPaths.Add($sourceTab.Path)
+            [MergeDisplay]::SetProgress($mergedPaths.Count)
+        }
     }
+    finally {
+        if ($null -ne $originalClipboard) {
+            try { [Windows.Forms.Clipboard]::SetDataObject($originalClipboard, $true) } catch {}
+        }
+        else {
+            try { [Windows.Forms.Clipboard]::Clear() } catch {}
+        }
+    }
+
+    Set-MergeStatus ("Closing {0} source window(s)..." -f $sourceHwnds.Count)
+    foreach ($sourceHwndValue in $sourceHwnds) {
+        $sourceHwnd = [IntPtr][int64]$sourceHwndValue
+        if ([ExplorerWindowControl]::IsWindow($sourceHwnd)) {
+            [void][ExplorerWindowControl]::PostMessage($sourceHwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+            $closedWindowCount++
+        }
+    }
+
+    Set-MergeStatus 'Merge complete.'
+    # Hold the finished frame briefly so the full bar is actually seen.
+    if ([MergeDisplay]::IsActive) { [MergeDisplay]::Pump(600) }
+}
+catch {
+    $mergeError = $_
 }
 finally {
-    if ($null -ne $originalClipboard) {
-        try { [Windows.Forms.Clipboard]::SetDataObject($originalClipboard, $true) } catch {}
-    }
-    else {
-        try { [Windows.Forms.Clipboard]::Clear() } catch {}
-    }
+    [MergeDisplay]::Stop()
 }
 
-foreach ($sourceHwndValue in $sourceHwnds) {
-    $sourceHwnd = [IntPtr][int64]$sourceHwndValue
-    if ([ExplorerWindowControl]::IsWindow($sourceHwnd)) {
-        [void][ExplorerWindowControl]::PostMessage($sourceHwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
-    }
+if ($null -ne $mergeError) {
+    Write-Host ''
+    Write-Host ("Merge stopped: {0}" -f $mergeError.Exception.Message) -ForegroundColor Red
+    Write-Host ("{0} of {1} tab(s) were merged. No source windows were closed, so nothing was lost." -f $mergedPaths.Count, $sourceTabs.Count)
+    Write-MergedFolderList -Paths $mergedPaths.ToArray() -Heading 'Folders that did make it into the destination window:'
+    Write-Host ''
+    Write-Host 'made with loving prompts by riecodes' -ForegroundColor DarkGray
+    Wait-ForAnyKey
+    exit 1
 }
 
-$finalTabCount = $targetGroup.Count + $sourceTabs.Count
-Write-Host ("Merged {0} tab(s) into the existing Explorer window; it now has {1} filesystem tab(s). Closed {2} source window(s)." -f $sourceTabs.Count, $finalTabCount, $sourceHwnds.Count)
+$finalTabCount = $targetGroup.Count + $mergedPaths.Count
+Write-Host ("Merged {0} folder(s) into the existing Explorer window; it now has {1} filesystem tab(s). Closed {2} source window(s)." -f $mergedPaths.Count, $finalTabCount, $closedWindowCount)
+Write-MergedFolderList -Paths $mergedPaths.ToArray() -Heading 'Merged folders:'
+Write-Host ''
 Write-Host 'made with loving prompts by riecodes' -ForegroundColor DarkGray
+Wait-ForAnyKey

@@ -27,6 +27,7 @@ powershell -ExecutionPolicy Bypass -File .\merge_file_explorers.ps1
 | `-NoAnimation` | switch | off | Run without the spinning folder and progress bar; status lines are printed as plain text instead. Aliased as `-NoSplash`. |
 | `-NoPause` | switch | off | Skip the "press any key to continue" prompt at the end. |
 | `-DelayScale` | double (0.25–10) | `1.0` | Multiplies every wait. Raise it if Explorer is slow to settle on your machine. |
+| `-Trace` | switch | off | Log what every step actually observed — tab counts, which control took focus, what the address bar held. Implies `-NoAnimation`. |
 | `-Verbose` | switch | off | Standard `CmdletBinding` verbose stream. |
 
 ```powershell
@@ -83,6 +84,7 @@ If the merge stops partway, the same list is printed for the tabs that *did* lan
 - **Nothing is destroyed.** Source windows are closed with `WM_CLOSE` (the same message the X button sends) only after their folder is confirmed open as a tab in the destination window. No file, folder, registry key, or setting is ever touched.
 - **Your clipboard is restored.** The original clipboard contents are captured before the merge and put back in a `finally` block, so an error mid-merge still restores it.
 - **It fails loudly, not quietly.** `Set-StrictMode -Version Latest` and `$ErrorActionPreference = 'Stop'` are set at the top. If the destination window cannot be focused, or a tab does not appear, the script stops with a message rather than closing windows it should not.
+- **Nothing is typed until `Ctrl+T` is confirmed.** A dropped `Ctrl+T` used to go unnoticed, and the `Ctrl+L` after it would land on the tab that was *already* open — so `Enter` navigated that tab away from where it was, and the merge then failed its own confirmation. A brand new tab sits on Home and reports an empty `LocationURL`, so it is invisible to the filesystem-tab filter but shows up in the unfiltered per-window count. That count is what the script waits on, retrying `Ctrl+T` up to three times before giving up without typing anything.
 - **`Ctrl+A` and `Enter` are gated behind a focus check.** A freshly opened tab lands on Home with focus in the *content view*, and it takes Explorer a moment to settle. A `Ctrl+L` sent too early gets swallowed by that view — and then `Ctrl+A` selects every file in the folder and `Enter` opens all of them. So the script asks UI Automation what actually holds focus and will not send that pair until the answer is the address bar. It retries `Ctrl+L` up to three times, then gives up with a message suggesting `-DelayScale 2`.
 - **It only reads directory paths.** It never reads file contents, never enumerates what is inside the folders, and never sends anything anywhere.
 
@@ -106,14 +108,14 @@ No. But it is worth explaining *why* an antivirus engine might raise an eyebrow 
 | UI Automation reads the focused element | Accessibility APIs can be used to scrape other apps | Two read-only questions, both about Explorer's own address bar: what control has focus, and what text is in it. It is a safety check — it is what stops the script from sending `Ctrl+A`+`Enter` into a folder view. |
 | Recommended with `-ExecutionPolicy Bypass` | A common malware launch pattern | Needed only because unsigned local scripts are blocked by default. You can instead sign it, or run `Unblock-File .\merge_file_explorers.ps1` once. |
 
-Things the script contains **zero** of: network calls, downloads, `Invoke-Expression`, base64 or otherwise obfuscated payloads, scheduled tasks, registry writes, persistence of any kind, file deletion, elevation prompts, and telemetry. Read it — it is 635 lines of commented PowerShell and C#.
+Things the script contains **zero** of: network calls, downloads, `Invoke-Expression`, base64 or otherwise obfuscated payloads, scheduled tasks, registry writes, persistence of any kind, file deletion, elevation prompts, and telemetry. Read it — it is 693 lines of commented PowerShell and C#.
 
 ### VirusTotal
 
 `merge_file_explorers.ps1`
 
 ```
-SHA256: 5780B9BDBF753655EBEF6680E3A14A8BDC18362510DAB3B41E82B6A111D2FE83
+SHA256: 5585FEB6422DE0951356D876D6627364A2149295BBE6C5A580CC65FCBBDD68E6
 ```
 
 Verify the copy you downloaded matches before you trust any report below:

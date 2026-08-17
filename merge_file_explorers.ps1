@@ -14,7 +14,11 @@ param(
 
     # Multiplies every wait. Raise it if Explorer is slow to settle on your machine.
     [ValidateRange(0.25, 10.0)]
-    [double]$DelayScale = 1.0
+    [double]$DelayScale = 1.0,
+
+    # Log what every step actually observed. Implies -NoAnimation, since the
+    # trace and the spinning folder cannot share the console.
+    [switch]$Trace
 )
 
 Set-StrictMode -Version Latest
@@ -485,6 +489,40 @@ function Get-AddressBarText {
     }
 }
 
+# Counts every tab in one Explorer window, including tabs on Home or This PC.
+# Those report an empty LocationURL, so Get-ExplorerFolderWindows filters them
+# out - but they are exactly what proves a fresh Ctrl+T tab appeared.
+function Get-ExplorerWindowTabCount {
+    param(
+        [Parameter(Mandatory)]
+        [IntPtr]$Hwnd
+    )
+
+    $shell = New-Object -ComObject Shell.Application
+    $count = 0
+    foreach ($window in @($shell.Windows())) {
+        try {
+            if ([IO.Path]::GetFileName($window.FullName) -ine 'explorer.exe') { continue }
+            if (([IntPtr][int64]$window.HWND) -eq $Hwnd) { $count++ }
+        }
+        catch {
+            # Explorer can close or navigate while its windows are enumerated.
+        }
+    }
+
+    return $count
+}
+
+function Write-Trace {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    if (-not $script:Trace) { return }
+    Write-Host ("  [{0:HH:mm:ss.fff}] {1}" -f [DateTime]::Now, $Message) -ForegroundColor DarkCyan
+}
+
 function Get-ExplorerFolderWindows {
     $shell = New-Object -ComObject Shell.Application
     $items = foreach ($window in @($shell.Windows())) {
@@ -547,21 +585,47 @@ function Add-ExplorerFolderTab {
         $_.Path -ieq $Path
     }).Count
 
+    $allTabsBefore = Get-ExplorerWindowTabCount -Hwnd $Hwnd
+    Write-Trace ("destination has {0} tab(s) total, {1} filesystem, {2} already at target" -f $allTabsBefore, $tabCountBefore, $matchingTabCountBefore)
+
     Set-ExplorerWindowForeground -Hwnd $Hwnd
     [Windows.Forms.Clipboard]::SetText($Path)
+    Write-Trace 'focused destination, clipboard set'
 
-    # A new tab lands on Home with focus in the content view, and it takes a
-    # moment to settle. Ctrl+L sent too early is swallowed by that view.
-    [Windows.Forms.SendKeys]::SendWait('^t')
-    Wait-Merge 1200
+    # Confirm Ctrl+T actually produced a tab before typing anything. A dropped
+    # Ctrl+T used to go unnoticed: the following Ctrl+L would land on the tab
+    # that was already open and Enter would navigate it away from where it was.
+    # A brand new tab sits on Home and reports an empty LocationURL, so it only
+    # shows up in the unfiltered count.
+    $tabOpened = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $tabOpened; $attempt++) {
+        [Windows.Forms.SendKeys]::SendWait('^t')
+        $tabDeadline = [DateTime]::UtcNow.AddSeconds(3)
+        do {
+            Wait-Merge 300
+            $allTabsNow = Get-ExplorerWindowTabCount -Hwnd $Hwnd
+            $tabOpened = $allTabsNow -gt $allTabsBefore
+        } while (-not $tabOpened -and [DateTime]::UtcNow -lt $tabDeadline)
+        Write-Trace ("Ctrl+T attempt {0}: tabs {1} -> {2}, opened={3}" -f $attempt, $allTabsBefore, $allTabsNow, $tabOpened)
+    }
 
-    # Never send Ctrl+A and Enter until the address bar is confirmed focused:
-    # in the folder view that pair selects every file and opens all of them.
+    if (-not $tabOpened) {
+        throw "Explorer never opened a new tab in the destination window for '$Path'. Nothing was typed or submitted, so no existing tab was navigated away. No source windows were closed. Try -DelayScale 2."
+    }
+
+    # Never send Ctrl+A and Enter until the address bar is confirmed focused and
+    # readable: in the folder view that pair selects every file and opens all of
+    # them. An editable control with no readable value is treated as a miss,
+    # because the paste could not then be verified either.
     $addressBar = $null
     for ($attempt = 1; $attempt -le 3 -and $null -eq $addressBar; $attempt++) {
         [Windows.Forms.SendKeys]::SendWait('^l')
         Wait-Merge 600
-        $addressBar = Get-FocusedAddressBar
+        $candidate = Get-FocusedAddressBar
+        if ($null -ne $candidate -and $null -ne (Get-AddressBarText -Element $candidate)) {
+            $addressBar = $candidate
+        }
+        Write-Trace ("Ctrl+L attempt {0}: focused={1}" -f $attempt, $(if ($null -eq $candidate) { 'not a text field' } else { "'" + $candidate.Current.Name + "' (" + $candidate.Current.ControlType.ProgrammaticName + ")" }))
     }
 
     if ($null -eq $addressBar) {
@@ -575,7 +639,8 @@ function Add-ExplorerFolderTab {
 
     # Confirm the paste actually landed before committing with Enter.
     $typedPath = Get-AddressBarText -Element $addressBar
-    if ($null -ne $typedPath -and $typedPath.TrimEnd('\') -ine $Path.TrimEnd('\')) {
+    Write-Trace ("address bar reads '{0}'" -f $typedPath)
+    if ($null -eq $typedPath -or $typedPath.TrimEnd('\') -ine $Path.TrimEnd('\')) {
         throw "The address bar held '$typedPath' instead of '$Path', so nothing was submitted. No source windows were closed."
     }
 
@@ -594,6 +659,7 @@ function Add-ExplorerFolderTab {
             $destinationTabs.Count -gt $tabCountBefore -and
             $matchingTabCount -gt $matchingTabCountBefore
         )
+        Write-Trace ("confirm: filesystem tabs {0} (was {1}), matching {2} (was {3})" -f $destinationTabs.Count, $tabCountBefore, $matchingTabCount, $matchingTabCountBefore)
     } while (-not $tabWasAdded -and [DateTime]::UtcNow -lt $deadline)
 
     if (-not $tabWasAdded) {
@@ -695,7 +761,7 @@ $mergedPaths = New-Object 'System.Collections.Generic.List[string]'
 $mergeError = $null
 $closedWindowCount = 0
 
-if (-not $NoAnimation) {
+if (-not $NoAnimation -and -not $Trace) {
     [MergeDisplay]::Start($sourceTabs.Count)
 }
 

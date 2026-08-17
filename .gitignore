@@ -1,0 +1,16 @@
+# Local / editor noise
+.vscode/
+.idea/
+*.user
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Never commit secrets
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+secrets.json
+credentials.json

@@ -513,6 +513,19 @@ function Get-ExplorerWindowTabCount {
     return $count
 }
 
+# Keystrokes go wherever the foreground is. If you alt-tab mid-merge, stop
+# before sending anything else rather than typing into whatever you switched to.
+function Assert-DestinationStillForeground {
+    param(
+        [Parameter(Mandatory)]
+        [IntPtr]$Hwnd
+    )
+
+    if ([ExplorerWindowControl]::GetForegroundWindow() -ne $Hwnd) {
+        throw 'Focus left the destination Explorer window mid-merge - did you alt-tab or click another window? Stopped before sending any more keystrokes. No source windows were closed.'
+    }
+}
+
 function Write-Trace {
     param(
         [Parameter(Mandatory)]
@@ -613,14 +626,19 @@ function Add-ExplorerFolderTab {
         throw "Explorer never opened a new tab in the destination window for '$Path'. Nothing was typed or submitted, so no existing tab was navigated away. No source windows were closed. Try -DelayScale 2."
     }
 
+    # The tab shows up in the shell listing well before its UI can take Ctrl+L.
+    # Without this the first Ctrl+L is swallowed every single time.
+    Wait-Merge 1200
+
     # Never send Ctrl+A and Enter until the address bar is confirmed focused and
     # readable: in the folder view that pair selects every file and opens all of
     # them. An editable control with no readable value is treated as a miss,
     # because the paste could not then be verified either.
     $addressBar = $null
-    for ($attempt = 1; $attempt -le 3 -and $null -eq $addressBar; $attempt++) {
+    for ($attempt = 1; $attempt -le 5 -and $null -eq $addressBar; $attempt++) {
+        Assert-DestinationStillForeground -Hwnd $Hwnd
         [Windows.Forms.SendKeys]::SendWait('^l')
-        Wait-Merge 600
+        Wait-Merge (400 + 200 * $attempt)
         $candidate = Get-FocusedAddressBar
         if ($null -ne $candidate -and $null -ne (Get-AddressBarText -Element $candidate)) {
             $addressBar = $candidate
@@ -631,6 +649,10 @@ function Add-ExplorerFolderTab {
     if ($null -eq $addressBar) {
         throw "The address bar never took focus for '$Path', so the path was not typed. Nothing was selected or opened, and no source windows were closed. Try -DelayScale 2."
     }
+
+    # Last check before the destructive pair. If you alt-tabbed away in the last
+    # few hundred milliseconds, Ctrl+A and Enter must not follow you there.
+    Assert-DestinationStillForeground -Hwnd $Hwnd
 
     [Windows.Forms.SendKeys]::SendWait('^a')
     Wait-Merge 150
@@ -644,6 +666,7 @@ function Add-ExplorerFolderTab {
         throw "The address bar held '$typedPath' instead of '$Path', so nothing was submitted. No source windows were closed."
     }
 
+    Assert-DestinationStillForeground -Hwnd $Hwnd
     [Windows.Forms.SendKeys]::SendWait('{ENTER}')
 
     $deadline = [DateTime]::UtcNow.AddSeconds(8)

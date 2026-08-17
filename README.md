@@ -12,6 +12,14 @@ Windows 11 gave File Explorer tabs but never gave it a "merge all windows" comma
 powershell -ExecutionPolicy Bypass -File .\merge_file_explorers.ps1
 ```
 
+### Running it without a terminal
+
+Double-clicking a `.ps1` opens it in an editor rather than running it, so the repo ships **`Merge File Explorers.cmd`**. Double-click that instead — it supplies the flags the script needs (`-STA` for the clipboard, `-ExecutionPolicy Bypass` because the script is unsigned and local, `-NoProfile` so your `$PROFILE` cannot change its behaviour).
+
+For a desktop or taskbar entry: right-click `Merge File Explorers.cmd` → **Send to** → **Desktop (create shortcut)**. The launcher passes arguments through, so you can append `-DelayScale 2` to the shortcut's Target if your machine needs longer waits.
+
+**Do not touch the mouse or keyboard while it runs.** The script has to hold the destination Explorer window in the foreground, because `SendKeys` types into whatever window is focused. If you alt-tab or click away mid-merge it stops immediately with a message — by design, so your folder path never gets typed into whatever you switched to. A merge costs roughly two seconds per window.
+
 ### Requirements
 
 - Windows 11 (build with File Explorer tab support — `Ctrl+T` must open a new tab in Explorer)
@@ -90,7 +98,7 @@ If the merge stops partway, the same list is printed for the tabs that *did* lan
 
 ### Known limitations
 
-- Because it drives the real UI with `SendKeys`, do not type or click during the merge — stolen focus will misroute the keystrokes. The tab-confirmation check will catch it and abort before closing anything, but you will have to rerun.
+- Because it drives the real UI with `SendKeys`, do not type or click during the merge. The script re-checks that the destination window is still foreground before every keystroke burst and stops the moment it is not, so alt-tabbing aborts the run rather than misrouting keys — but you will have to rerun it.
 - The destination Explorer window has to be foreground for `SendKeys` to reach it, so the console — and the animation in it — sits behind Explorer for the duration. The script pulls focus back to the console once the merge is done, before it prints the summary and waits for a key.
 - Explorer windows showing virtual locations (`This PC`, `Quick access`, network namespaces without a drive path, Recycle Bin) are skipped by design.
 - If Explorer is configured to open folders in separate processes, or tabs are disabled, the script will report that no tab appeared and stop.
@@ -108,14 +116,14 @@ No. But it is worth explaining *why* an antivirus engine might raise an eyebrow 
 | UI Automation reads the focused element | Accessibility APIs can be used to scrape other apps | Two read-only questions, both about Explorer's own address bar: what control has focus, and what text is in it. It is a safety check — it is what stops the script from sending `Ctrl+A`+`Enter` into a folder view. |
 | Recommended with `-ExecutionPolicy Bypass` | A common malware launch pattern | Needed only because unsigned local scripts are blocked by default. You can instead sign it, or run `Unblock-File .\merge_file_explorers.ps1` once. |
 
-Things the script contains **zero** of: network calls, downloads, `Invoke-Expression`, base64 or otherwise obfuscated payloads, scheduled tasks, registry writes, persistence of any kind, file deletion, elevation prompts, and telemetry. Read it — it is 693 lines of commented PowerShell and C#.
+Things the script contains **zero** of: network calls, downloads, `Invoke-Expression`, base64 or otherwise obfuscated payloads, scheduled tasks, registry writes, persistence of any kind, file deletion, elevation prompts, and telemetry. Read it — it is 712 lines of commented PowerShell and C#.
 
 ### VirusTotal
 
 `merge_file_explorers.ps1`
 
 ```
-SHA256: 5585FEB6422DE0951356D876D6627364A2149295BBE6C5A580CC65FCBBDD68E6
+SHA256: 6E23EC61AE688F24A95EFC0C3D9F6EC08EF525E745453556D761C67618BB25D8
 ```
 
 Verify the copy you downloaded matches before you trust any report below:

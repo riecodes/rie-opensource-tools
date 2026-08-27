@@ -16,3 +16,6 @@ secrets.json
 credentials.json
 
 PROMPT.md
+
+# Tool-specific backups and state files
+battery-state-backup.json

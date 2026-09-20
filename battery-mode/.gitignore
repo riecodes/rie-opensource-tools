@@ -1,0 +1,5 @@
+battery-state-backup.json
+*.swp
+*.swo
+*~
+.DS_Store
